@@ -16,17 +16,18 @@ const App = (() => {
     LOCATION_LABEL: 'currentLocation'
   };
 
-  const OPTS = {
+  const CONFIG = {
     AUTOCOMPLETE_DELAY: 250,
     SUGGEST_LIMIT: 8,
     GEO_LIMIT: 5,
     FORECAST_DAYS: 3,
-    GEO_WAIT_MS: 10000,
+    GEO_TIMEOUT_MS: 10000,
     CACHE_TTL_MS: 5 * 60 * 1000,
-    MAX_CONCURRENT: 3
+    MAX_CONCURRENT: 3,
+    STORAGE_KEY: 'cities'
   };
 
-  const $id = (i) => document.getElementById(i);
+  const $id = (id) => document.getElementById(id);
 
   function safeParse(raw, fallback) {
     try {
@@ -38,18 +39,13 @@ const App = (() => {
     }
   }
 
-  const storage = {
-    load(k, d) {
-      try { return safeParse(localStorage.getItem(k), d); } catch (e) { return d; }
-    },
-    save(k, v) {
-      try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {}
-    }
-  };
+  function uid(n = 7) {
+    return Math.random().toString(36).slice(2, 2 + n);
+  }
 
-  function randId(n = 7) { return Math.random().toString(36).slice(2, 2 + n); }
-
-  function esc(s) { return String(s).replace(/[&<>"']/g, (m) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m])); }
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (m) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
+  }
 
   function niceDate(iso) {
     try {
@@ -62,7 +58,10 @@ const App = (() => {
 
   function debounce(fn, t) {
     let timer = null;
-    return (...a) => { clearTimeout(timer); timer = setTimeout(() => fn(...a), t); };
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), t);
+    };
   }
 
   const CODE_MAP = {
@@ -72,199 +71,255 @@ const App = (() => {
     81: "Сильный ливень",82: "Очень сильный ливень",95: "Гроза",96: "Гроза с небольшим градом",99: "Гроза с градом"
   };
 
-  async function geoSearch(name, limit = OPTS.SUGGEST_LIMIT) {
-    const url = `${ENDPOINTS.GEO_NAME}?name=${encodeURIComponent(name)}&count=${limit}&language=ru&format=json`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error('geocode error');
-    return r.json();
+  class ApiClient {
+    constructor(endpoints) { this.endpoints = endpoints; }
+    async geocode(q, limit = CONFIG.SUGGEST_LIMIT) {
+      const url = `${this.endpoints.GEO_NAME}?name=${encodeURIComponent(q)}&count=${limit}&language=ru&format=json`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('geocode error');
+      return r.json();
+    }
+    async reverse(lat, lon, limit = 1) {
+      try {
+        const url = `${this.endpoints.GEO_REV}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&count=${limit}&language=ru`;
+        const r = await fetch(url);
+        if (!r.ok) return null;
+        return r.json();
+      } catch (e) { return null; }
+    }
+    async forecast(lat, lon, days = CONFIG.FORECAST_DAYS) {
+      const url = `${this.endpoints.FORECAST}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&daily=temperature_2m_max,temperature_2m_min,weathercode&timezone=auto&forecast_days=${days}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('forecast error');
+      return r.json();
+    }
   }
 
-  async function geoReverse(lat, lon, limit = 1) {
-    try {
-      const url = `${ENDPOINTS.GEO_REV}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&count=${limit}&language=ru`;
-      const r = await fetch(url);
-      if (!r.ok) return null;
-      return r.json();
-    } catch (e) { return null; }
+  class StorageService {
+    constructor(key) { this.key = key; }
+    load(defaultValue) {
+      try { return safeParse(localStorage.getItem(this.key), defaultValue); } catch (e) { return defaultValue; }
+    }
+    save(value) {
+      try { localStorage.setItem(this.key, JSON.stringify(value)); } catch (e) {}
+    }
   }
 
   class RequestPool {
-    constructor(max = OPTS.MAX_CONCURRENT) { this.max = max; this.running = 0; this.queue = []; }
-    push(task) { return new Promise((res, rej) => { this.queue.push({task, res, rej}); this._next(); }); }
-    _next() {
-      if (this.running >= this.max || this.queue.length === 0) return;
-      const item = this.queue.shift(); this.running++;
-      Promise.resolve().then(() => item.task()).then(v => { item.res(v); }).catch(e => { item.rej(e); }).finally(() => { this.running--; this._next(); });
-    }
-  }
-
-  const pool = new RequestPool(OPTS.MAX_CONCURRENT);
-  const forecastCache = new Map();
-
-  function coordsKey(lat, lon) { return `${(Math.round(lat * 1e6) / 1e6).toFixed(6)},${(Math.round(lon * 1e6) / 1e6).toFixed(6)}`; }
-
-  async function fetchForecast(lat, lon, days = OPTS.FORECAST_DAYS, force = false) {
-    const key = coordsKey(lat, lon);
-    const now = Date.now();
-    if (!force && forecastCache.has(key)) {
-      const item = forecastCache.get(key);
-      if (now - item.ts < OPTS.CACHE_TTL_MS) return item.data;
-    }
-    const task = () => fetch(`${ENDPOINTS.FORECAST}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&daily=temperature_2m_max,temperature_2m_min,weathercode&timezone=auto&forecast_days=${days}`).then(r => { if (!r.ok) throw new Error('forecast error'); return r.json(); });
-    const res = await pool.push(task);
-    forecastCache.set(key, { ts: now, data: res });
-    return res;
-  }
-
-  class WeatherController {
-    constructor() {
-      this.view = {
-        container: $id(ELEMENTS.LIST),
-        suggestions: $id(ELEMENTS.AUTOCOMPLETE),
-        error: $id(ELEMENTS.ERROR_BOX),
-        input: $id(ELEMENTS.INPUT),
-        refreshBtn: $id(ELEMENTS.BTN_REFRESH),
-        addBtn: $id(ELEMENTS.BTN_ADD),
-        geoBtn: $id(ELEMENTS.BTN_GEO),
-        locationLabel: $id(ELEMENTS.LOCATION_LABEL)
-      };
-      this.savedCities = storage.load('cities', []) || [];
-      this.picked = null;
-      this.cache = new Map();
-      this._attach();
-      if (this.view.suggestions) { this.view.suggestions.style.display = 'none'; this.view.suggestions.innerHTML = ''; }
-    }
-
-    _attach() {
-      if (this.view.input) {
-        this.view.input.addEventListener('input', debounce(() => this._handleType(), OPTS.AUTOCOMPLETE_DELAY));
-        this.view.input.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter') { e.preventDefault(); this.addFromInput(); }
-          if (e.key === 'Escape' && this.view.suggestions) { this.view.suggestions.style.display = 'none'; this.view.suggestions.innerHTML = ''; }
-        });
-      }
-      if (this.view.suggestions) {
-        this.view.suggestions.addEventListener('click', (e) => {
-          const li = e.target.closest('li'); if (!li) return;
-          const lat = parseFloat(li.dataset.lat); const lon = parseFloat(li.dataset.lon);
-          const disp = li.dataset.display || li.textContent.trim();
-          this.picked = { name: disp.split(',')[0].trim(), display: disp, lat, lon };
-          this.view.input.value = disp;
-          this.view.suggestions.style.display = 'none'; this.view.suggestions.innerHTML = '';
-        });
-      }
-      document.addEventListener('click', (e) => {
-        if (this.view.input && !this.view.input.contains(e.target) && this.view.suggestions && !this.view.suggestions.contains(e.target)) {
-          this.view.suggestions.style.display = 'none'; this.view.suggestions.innerHTML = '';
-        }
+    constructor(max = CONFIG.MAX_CONCURRENT) { this.max = max; this.running = 0; this.queue = []; }
+    push(fn) {
+      return new Promise((resolve, reject) => {
+        this.queue.push({fn, resolve, reject});
+        this._runNext();
       });
-      if (this.view.refreshBtn) this.view.refreshBtn.addEventListener('click', () => this.refreshAll(true));
-      if (this.view.addBtn) this.view.addBtn.addEventListener('click', () => this.addFromInput());
-      if (this.view.geoBtn) this.view.geoBtn.addEventListener('click', () => this.applyGeo(true));
     }
-
-    async _handleType() {
-      const q = (this.view.input && this.view.input.value) ? this.view.input.value.trim() : '';
-      this.picked = null;
-      if (this.view.error) this.view.error.textContent = '';
-      if (!q) { if (this.view.suggestions) { this.view.suggestions.style.display = 'none'; this.view.suggestions.innerHTML = ''; } return; }
-      if (this.cache.has(q)) { this._showSuggestions(this.cache.get(q)); return; }
-      try {
-        const data = await geoSearch(q, OPTS.SUGGEST_LIMIT);
-        const list = (data && data.results) ? data.results : [];
-        this.cache.set(q, list);
-        this._showSuggestions(list);
-      } catch (err) {
-        if (this.view.suggestions) this.view.suggestions.style.display = 'none';
-      }
+    _runNext() {
+      if (this.running >= this.max || this.queue.length === 0) return;
+      const item = this.queue.shift();
+      this.running++;
+      Promise.resolve().then(() => item.fn()).then(res => item.resolve(res)).catch(err => item.reject(err)).finally(() => { this.running--; this._runNext(); });
     }
+  }
 
-    _showSuggestions(items) {
-      if (!this.view.suggestions) return;
-      if (!items || items.length === 0) { this.view.suggestions.style.display = 'none'; this.view.suggestions.innerHTML = ''; return; }
-      this.view.suggestions.innerHTML = items.map(r => {
+  class ForecastCache {
+    constructor(ttl = CONFIG.CACHE_TTL_MS) { this.ttl = ttl; this.store = new Map(); }
+    _key(lat, lon) { return `${(Math.round(lat*1e6)/1e6).toFixed(6)},${(Math.round(lon*1e6)/1e6).toFixed(6)}`; }
+    get(lat, lon) {
+      const key = this._key(lat, lon);
+      const now = Date.now();
+      const item = this.store.get(key);
+      if (!item) return null;
+      if (now - item.ts > this.ttl) { this.store.delete(key); return null; }
+      return item.data;
+    }
+    set(lat, lon, data) {
+      const key = this._key(lat, lon);
+      this.store.set(key, { ts: Date.now(), data });
+    }
+    clear() { this.store.clear(); }
+  }
+
+  class CityStore {
+    constructor(initial = []) { this.cities = Array.isArray(initial) ? initial : []; }
+    all() { return this.cities.slice(); }
+    add(city) { this.cities.push(city); }
+    removeById(id) { this.cities = this.cities.filter(c => c.id !== id); }
+    findGeo() { return this.cities.find(c => c.isGeo); }
+    findById(id) { return this.cities.find(c => c.id === id); }
+    hasCoords(lat, lon) {
+      const toKey = (a,b) => `${(Math.round((a||0)*1e6)/1e6).toFixed(6)},${(Math.round((b||0)*1e6)/1e6).toFixed(6)}`;
+      const key = toKey(lat, lon);
+      return this.cities.some(c => toKey(c.lat || 0, c.lon || 0) === key);
+    }
+    replaceGeo(lat, lon, display) {
+      const g = this.findGeo();
+      if (g) { g.lat = lat; g.lon = lon; g.displayName = display; }
+      else this.cities.unshift({ id: uid(), name: 'geo', displayName: display, lat, lon, isGeo: true });
+    }
+    saveTo(storageService) { storageService.save(this.cities); }
+  }
+
+  class UIRenderer {
+    constructor(elements) {
+      this.container = $id(elements.LIST);
+      this.suggestions = $id(elements.AUTOCOMPLETE);
+      this.errorBox = $id(elements.ERROR_BOX);
+      this.input = $id(elements.INPUT);
+      this.btnRefresh = $id(elements.BTN_REFRESH);
+      this.btnAdd = $id(elements.BTN_ADD);
+      this.btnGeo = $id(elements.BTN_GEO);
+      this.locLabel = $id(elements.LOCATION_LABEL);
+    }
+    clearSuggestions() { if (this.suggestions) { this.suggestions.style.display = 'none'; this.suggestions.innerHTML = ''; } }
+    renderSuggestions(list) {
+      if (!this.suggestions) return;
+      if (!list || list.length === 0) { this.clearSuggestions(); return; }
+      this.suggestions.innerHTML = list.map(r => {
         const label = `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ', ' + r.country : ''}`;
         return `<li data-lat="${r.latitude}" data-lon="${r.longitude}" data-display="${esc(label)}">${esc(label)}</li>`;
       }).join('');
-      this.view.suggestions.style.display = 'block';
+      this.suggestions.style.display = 'block';
     }
-
-    async addFromInput() {
-      const raw = (this.view.input && this.view.input.value) ? this.view.input.value.trim() : '';
-      if (this.view.error) this.view.error.textContent = '';
-      if (!raw) { if (this.view.error) this.view.error.textContent = 'Введите название города'; return; }
-      try {
-        if (this.picked && this.picked.display === raw) {
-          const sel = this.picked;
-          if (this._dupCoords(sel.lat, sel.lon)) { if (this.view.error) this.view.error.textContent = 'Этот город уже добавлен'; return; }
-          this.savedCities.push({ id: randId(), name: sel.name, displayName: sel.display, lat: sel.lat, lon: sel.lon, isGeo: false });
-          storage.save('cities', this.savedCities);
-          this.view.input.value = '';
-          this.picked = null;
-          this.renderAll();
-          return;
-        }
-        if (this.view.error) this.view.error.textContent = 'Проверка';
-        const geo = await geoSearch(raw, OPTS.GEO_LIMIT);
-        if (!geo.results || geo.results.length === 0) { if (this.view.error) this.view.error.textContent = 'Город не найден'; return; }
-        const best = geo.results[0];
-        if (this._dupCoords(best.latitude, best.longitude)) { if (this.view.error) this.view.error.textContent = 'Этот город уже добавлен'; return; }
-        const display = `${best.name}${best.admin1 ? ', ' + best.admin1 : ''}${best.country ? ', ' + best.country : ''}`;
-        this.savedCities.push({ id: randId(), name: best.name, displayName: display, lat: best.latitude, lon: best.longitude, isGeo: false });
-        storage.save('cities', this.savedCities);
-        this.view.input.value = '';
-        if (this.view.error) this.view.error.textContent = '';
-        this.renderAll();
-      } catch (err) {
-        if (this.view.error) this.view.error.textContent = 'Ошибка сети';
-      }
-    }
-
-    _dupCoords(lat, lon) {
-      const key = coordsKey(lat, lon);
-      return Array.isArray(this.savedCities) && this.savedCities.some(c => coordsKey(c.lat || 0, c.lon || 0) === key);
-    }
-
-    renderAll() {
-      if (!this.view.container) return;
-      this.view.container.innerHTML = '';
-      if (!Array.isArray(this.savedCities) || this.savedCities.length === 0) {
-        this.view.container.innerHTML = `<p class="loading">Нет сохранённых городов</p>`;
-        this._updateHeader();
-        return;
-      }
-      const nodes = [];
-      for (const c of this.savedCities) {
-        const card = this._buildCard(c);
-        nodes.push(card);
-      }
-      nodes.forEach(n => this.view.container.appendChild(n));
-      const fills = this.savedCities.map((c, i) => this._populateCard(c, nodes[i]));
-      return Promise.all(fills).then(() => this._updateHeader()).catch(() => this._updateHeader());
-    }
-
-    _buildCard(city) {
+    setError(text) { if (this.errorBox) this.errorBox.textContent = text || ''; }
+    createCard(city) {
       const wrap = document.createElement('div');
-      wrap.className = 'weather-card'; wrap.dataset.id = city.id;
+      wrap.className = 'weather-card';
+      wrap.dataset.id = city.id;
       wrap.innerHTML = `
         <div class="card-top">
           <div>
             <div class="card-title">${esc(city.displayName || city.name)}</div>
-            <div class="card-meta">${city.isGeo ? 'Ваше текущее местоположение' : 'Город'}</div>
+            <div class="card-meta">${city.isGeo ? 'Текущее местоположение' : 'Город'}</div>
           </div>
           <div class="card-actions"><button class="btn remove-card">Удалить</button></div>
         </div>
         <div class="card-body"><p class="loading">Загрузка</p></div>
       `;
       const rem = wrap.querySelector('.remove-card');
-      rem.addEventListener('click', () => {
-        const wasGeo = this.savedCities.find(x => x.id === city.id && x.isGeo);
-        this.savedCities = this.savedCities.filter(x => x.id !== city.id);
-        storage.save('cities', this.savedCities);
-        this.renderAll();
-        if (wasGeo) this._updateHeader();
+      if (rem) rem.addEventListener('click', () => {
+        const ev = new CustomEvent('city:remove', { detail: { id: city.id } });
+        document.dispatchEvent(ev);
       });
       return wrap;
+    }
+    renderEmpty() {
+      if (!this.container) return;
+      this.container.innerHTML = `<p class="loading">Нет сохранённых городов</p>`;
+    }
+    async renderAllCards(cityList, fillFn) {
+      if (!this.container) return;
+      this.container.innerHTML = '';
+      if (!Array.isArray(cityList) || cityList.length === 0) { this.renderEmpty(); return; }
+      const nodes = cityList.map(c => this.createCard(c));
+      nodes.forEach(n => this.container.appendChild(n));
+      const fills = cityList.map((c, i) => fillFn(c, nodes[i]));
+      try { await Promise.all(fills); } catch (e) {}
+    }
+    updateHeader(display) {
+      if (!this.locLabel) return;
+      this.locLabel.textContent = display ? `Местоположение: ${display}` : '';
+    }
+  }
+
+  class WeatherApp {
+    constructor() {
+      this.api = new ApiClient(ENDPOINTS);
+      this.storage = new StorageService(CONFIG.STORAGE_KEY);
+      const initial = this.storage.load([]);
+      this.store = new CityStore(initial);
+      this.ui = new UIRenderer(ELEMENTS);
+      this.pool = new RequestPool(CONFIG.MAX_CONCURRENT);
+      this.cache = new ForecastCache(CONFIG.CACHE_TTL_MS);
+      this._bindUI();
+    }
+
+    _bindUI() {
+      if (this.ui.input) {
+        this.ui.input.addEventListener('input', debounce(() => this._onType(), CONFIG.AUTOCOMPLETE_DELAY));
+        this.ui.input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); this._onAdd(); }
+          if (e.key === 'Escape') this.ui.clearSuggestions();
+        });
+      }
+      if (this.ui.suggestions) {
+        this.ui.suggestions.addEventListener('click', (e) => {
+          const li = e.target.closest('li'); if (!li) return;
+          const lat = parseFloat(li.dataset.lat); const lon = parseFloat(li.dataset.lon);
+          const disp = li.dataset.display || li.textContent.trim();
+          this._selected = { name: disp.split(',')[0].trim(), display: disp, lat, lon };
+          if (this.ui.input) this.ui.input.value = disp;
+          this.ui.clearSuggestions();
+        });
+      }
+      document.addEventListener('click', (e) => {
+        if (this.ui.input && !this.ui.input.contains(e.target) && this.ui.suggestions && !this.ui.suggestions.contains(e.target)) this.ui.clearSuggestions();
+      });
+      if (this.ui.btnAdd) this.ui.btnAdd.addEventListener('click', () => this._onAdd());
+      if (this.ui.btnRefresh) this.ui.btnRefresh.addEventListener('click', () => this.refreshAll(true));
+      if (this.ui.btnGeo) this.ui.btnGeo.addEventListener('click', () => this.applyGeolocation(true));
+      document.addEventListener('city:remove', (e) => {
+        const id = e.detail && e.detail.id;
+        if (!id) return;
+        const wasGeo = this.store.findById(id) && this.store.findById(id).isGeo;
+        this.store.removeById(id);
+        this.store.saveTo(this.storage);
+        this.render();
+        if (wasGeo) this._refreshHeader();
+      });
+    }
+
+    async _onType() {
+      const q = this.ui.input && this.ui.input.value ? this.ui.input.value.trim() : '';
+      this._selected = null;
+      this.ui.setError('');
+      if (!q) { this.ui.clearSuggestions(); return; }
+      try {
+        const cached = this._suggestCache && this._suggestCache[q];
+        if (cached) { this.ui.renderSuggestions(cached); return; }
+        const data = await this.api.geocode(q, CONFIG.SUGGEST_LIMIT);
+        const list = (data && data.results) ? data.results : [];
+        this._suggestCache = this._suggestCache || {};
+        this._suggestCache[q] = list;
+        this.ui.renderSuggestions(list);
+      } catch (err) { this.ui.clearSuggestions(); }
+    }
+
+    async _onAdd() {
+      const raw = this.ui.input && this.ui.input.value ? this.ui.input.value.trim() : '';
+      this.ui.setError('');
+      if (!raw) { this.ui.setError('Введите название города'); return; }
+      try {
+        if (this._selected && this._selected.display === raw) {
+          const s = this._selected;
+          if (this.store.hasCoords(s.lat, s.lon)) { this.ui.setError('Этот город уже добавлен'); return; }
+          this.store.add({ id: uid(), name: s.name, displayName: s.display, lat: s.lat, lon: s.lon, isGeo: false });
+          this.store.saveTo(this.storage);
+          if (this.ui.input) this.ui.input.value = '';
+          this._selected = null;
+          await this.render();
+          return;
+        }
+        this.ui.setError('Проверка');
+        const geo = await this.api.geocode(raw, CONFIG.GEO_LIMIT);
+        if (!geo.results || geo.results.length === 0) { this.ui.setError('Город не найден'); return; }
+        const best = geo.results[0];
+        if (this.store.hasCoords(best.latitude, best.longitude)) { this.ui.setError('Этот город уже добавлен'); return; }
+        const display = `${best.name}${best.admin1 ? ', ' + best.admin1 : ''}${best.country ? ', ' + best.country : ''}`;
+        this.store.add({ id: uid(), name: best.name, displayName: display, lat: best.latitude, lon: best.longitude, isGeo: false });
+        this.store.saveTo(this.storage);
+        if (this.ui.input) this.ui.input.value = '';
+        this.ui.setError('');
+        await this.render();
+      } catch (err) { this.ui.setError('Ошибка сети'); }
+    }
+
+    async _fetchForecastWithPool(lat, lon, force = false) {
+      const cached = this.cache.get(lat, lon);
+      if (!force && cached) return cached;
+      const task = () => this.api.forecast(lat, lon, CONFIG.FORECAST_DAYS);
+      const res = await this.pool.push(task);
+      this.cache.set(lat, lon, res);
+      return res;
     }
 
     async _populateCard(city, elCard, force = false) {
@@ -273,12 +328,12 @@ const App = (() => {
       try {
         let { lat, lon } = city;
         if ((!lat || !lon) && !city.isGeo) {
-          const g = await geoSearch(city.name, 1);
-          if (!g.results || g.results.length === 0) { body.innerHTML = `<p class="error">Город не найден.</p>`; return; }
+          const g = await this.api.geocode(city.name, 1);
+          if (!g.results || g.results.length === 0) { body.innerHTML = `<p class="error">Город не найден</p>`; return; }
           const best = g.results[0];
-          lat = best.latitude; lon = best.longitude; city.lat = lat; city.lon = lon; storage.save('cities', this.savedCities);
+          lat = best.latitude; lon = best.longitude; city.lat = lat; city.lon = lon; this.store.saveTo(this.storage);
         }
-        const fx = await fetchForecast(lat, lon, OPTS.FORECAST_DAYS, force);
+        const fx = await this._fetchForecastWithPool(lat, lon, force);
         const times = (fx.daily && fx.daily.time) ? fx.daily.time : [];
         const tmin = (fx.daily && fx.daily.temperature_2m_min) ? fx.daily.temperature_2m_min : [];
         const tmax = (fx.daily && fx.daily.temperature_2m_max) ? fx.daily.temperature_2m_max : [];
@@ -298,68 +353,65 @@ const App = (() => {
       }
     }
 
+    async render() {
+      const list = this.store.all();
+      await this.ui.renderAllCards(list, (city, node) => this._populateCard(city, node));
+      this._refreshHeader();
+    }
+
     async refreshAll(force = false) {
-      forecastCache.clear();
+      this.cache.clear();
       const cards = Array.from(document.querySelectorAll('.weather-card'));
       const promises = cards.map(c => {
-        const id = c.dataset.id; const city = this.savedCities.find(x => x.id === id);
+        const id = c.dataset.id; const city = this.store.findById(id);
         if (city) return this._populateCard(city, c, force); return Promise.resolve();
       });
       return Promise.all(promises);
     }
 
-    _getPos(opts = {}) {
+    _refreshHeader() {
+      const geo = this.store.findGeo();
+      this.ui.updateHeader(geo ? geo.displayName || 'Текущее местоположение' : '');
+    }
+
+    _getCurrentPosition(opts = {}) {
       return new Promise((res, rej) => {
         if (!navigator.geolocation) return rej(new Error('Геолокация не поддерживается'));
         navigator.geolocation.getCurrentPosition(res, rej, opts);
       });
     }
 
-    async applyGeo(showErr = true) {
+    async applyGeolocation(showErr = true) {
       try {
-        const pos = await this._getPos({ timeout: OPTS.GEO_WAIT_MS });
+        const pos = await this._getCurrentPosition({ timeout: CONFIG.GEO_TIMEOUT_MS });
         const lat = pos.coords.latitude; const lon = pos.coords.longitude;
-        let disp = null;
-        const rev = await geoReverse(lat, lon, 1);
+        let display = null;
+        const rev = await this.api.reverse(lat, lon, 1);
         if (rev && rev.results && rev.results[0]) {
           const r = rev.results[0];
-          disp = `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ', ' + r.country : ''}`;
+          display = `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ', ' + r.country : ''}`;
         }
-        if (!disp) disp = 'Текущее местоположение';
-        const existing = Array.isArray(this.savedCities) ? this.savedCities.find(x => x.isGeo) : undefined;
-        if (existing) {
-          existing.lat = lat; existing.lon = lon; existing.displayName = disp;
-          storage.save('cities', this.savedCities); this.renderAll();
-        } else {
-          const item = { id: randId(), name: 'geo', displayName: disp, lat, lon, isGeo: true };
-          this.savedCities.unshift(item); storage.save('cities', this.savedCities); this.renderAll();
-        }
-        this._updateHeader();
-        if (this.view.error) this.view.error.textContent = '';
+        if (!display) display = 'Текущее местоположение';
+        this.store.replaceGeo(lat, lon, display);
+        this.store.saveTo(this.storage);
+        await this.render();
+        this.ui.setError('');
       } catch (err) {
         if (!showErr) return;
-        if (err && err.code === 1 && this.view.error) this.view.error.textContent = 'Доступ к геопозиции запрещён';
-        else if (this.view.error) this.view.error.textContent = 'Не удалось получить геопозицию';
-      }
-    }
-
-    _updateHeader() {
-      const geo = Array.isArray(this.savedCities) ? this.savedCities.find(c => c.isGeo) : null;
-      if (this.view.locationLabel) {
-        if (geo) this.view.locationLabel.textContent = `Местоположение: ${geo.displayName || 'Текущее местоположение'}`;
-        else this.view.locationLabel.textContent = '';
+        if (err && err.code === 1) this.ui.setError('Доступ к геопозиции запрещён');
+        else this.ui.setError('Не удалось получить геопозицию');
       }
     }
 
     async start() {
-      if ((!this.savedCities || this.savedCities.length === 0) && navigator.geolocation) {
-        try { await this.applyGeo(false); } catch (e) {}
+      if ((!this.store.all() || this.store.all().length === 0) && navigator.geolocation) {
+        try { await this.applyGeolocation(false); } catch (e) {}
       }
-      this.renderAll();
+      await this.render();
     }
   }
 
-  return new WeatherController();
+  return new WeatherApp();
 })();
 
 document.addEventListener('DOMContentLoaded', () => { if (typeof App.start === 'function') App.start(); });
