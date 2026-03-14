@@ -196,7 +196,7 @@ const App = (() => {
       try {
         if (this.picked && this.picked.display === raw) {
           const sel = this.picked;
-          if (this._dupCoords(sel.lat, sel.lon)) { if (this.view.error) this.view.error.textContent = 'Этот город уже добавлен.'; return; }
+          if (this._dupCoords(sel.lat, sel.lon)) { if (this.view.error) this.view.error.textContent = 'Этот город уже добавлен'; return; }
           this.savedCities.push({ id: randId(), name: sel.name, displayName: sel.display, lat: sel.lat, lon: sel.lon, isGeo: false });
           storage.save('cities', this.savedCities);
           this.view.input.value = '';
@@ -204,11 +204,11 @@ const App = (() => {
           this.renderAll();
           return;
         }
-        if (this.view.error) this.view.error.textContent = 'Проверка...';
+        if (this.view.error) this.view.error.textContent = 'Проверка';
         const geo = await geoSearch(raw, OPTS.GEO_LIMIT);
-        if (!geo.results || geo.results.length === 0) { if (this.view.error) this.view.error.textContent = 'Город не найден.'; return; }
+        if (!geo.results || geo.results.length === 0) { if (this.view.error) this.view.error.textContent = 'Город не найден'; return; }
         const best = geo.results[0];
-        if (this._dupCoords(best.latitude, best.longitude)) { if (this.view.error) this.view.error.textContent = 'Этот город уже добавлен.'; return; }
+        if (this._dupCoords(best.latitude, best.longitude)) { if (this.view.error) this.view.error.textContent = 'Этот город уже добавлен'; return; }
         const display = `${best.name}${best.admin1 ? ', ' + best.admin1 : ''}${best.country ? ', ' + best.country : ''}`;
         this.savedCities.push({ id: randId(), name: best.name, displayName: display, lat: best.latitude, lon: best.longitude, isGeo: false });
         storage.save('cities', this.savedCities);
@@ -229,7 +229,7 @@ const App = (() => {
       if (!this.view.container) return;
       this.view.container.innerHTML = '';
       if (!Array.isArray(this.savedCities) || this.savedCities.length === 0) {
-        this.view.container.innerHTML = `<p class="loading">Нет сохранённых городов. Разрешите геолокацию или добавьте город вручную.</p>`;
+        this.view.container.innerHTML = `<p class="loading">Нет сохранённых городов</p>`;
         this._updateHeader();
         return;
       }
@@ -250,11 +250,11 @@ const App = (() => {
         <div class="card-top">
           <div>
             <div class="card-title">${esc(city.displayName || city.name)}</div>
-            <div class="card-meta">${city.isGeo ? 'Текущее местоположение' : 'Город'}</div>
+            <div class="card-meta">${city.isGeo ? 'Ваше текущее местоположение' : 'Город'}</div>
           </div>
           <div class="card-actions"><button class="btn remove-card">Удалить</button></div>
         </div>
-        <div class="card-body"><p class="loading">Загрузка...</p></div>
+        <div class="card-body"><p class="loading">Загрузка</p></div>
       `;
       const rem = wrap.querySelector('.remove-card');
       rem.addEventListener('click', () => {
@@ -269,7 +269,7 @@ const App = (() => {
 
     async _populateCard(city, elCard, force = false) {
       const body = elCard.querySelector('.card-body'); if (!body) return;
-      body.innerHTML = `<p class="loading">Загрузка...</p>`;
+      body.innerHTML = `<p class="loading">Загрузка</p>`;
       try {
         let { lat, lon } = city;
         if ((!lat || !lon) && !city.isGeo) {
