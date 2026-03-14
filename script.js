@@ -20,8 +20,10 @@ const App = (() => {
     AUTOCOMPLETE_DELAY: 250,
     SUGGEST_LIMIT: 8,
     GEO_LIMIT: 5,
-    FORECAST_DAYS: 4,
-    GEO_WAIT_MS: 10000
+    FORECAST_DAYS: 3,
+    GEO_WAIT_MS: 10000,
+    CACHE_TTL_MS: 5 * 60 * 1000,
+    MAX_CONCURRENT: 3
   };
 
   const $id = (i) => document.getElementById(i);
@@ -45,13 +47,9 @@ const App = (() => {
     }
   };
 
-  function randId(n = 7) {
-    return Math.random().toString(36).slice(2, 2 + n);
-  }
+  function randId(n = 7) { return Math.random().toString(36).slice(2, 2 + n); }
 
-  function esc(s) {
-    return String(s).replace(/[&<>"']/g, (m) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
-  }
+  function esc(s) { return String(s).replace(/[&<>"']/g, (m) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m])); }
 
   function niceDate(iso) {
     try {
@@ -64,10 +62,7 @@ const App = (() => {
 
   function debounce(fn, t) {
     let timer = null;
-    return (...a) => {
-      clearTimeout(timer);
-      timer = setTimeout(() => fn(...a), t);
-    };
+    return (...a) => { clearTimeout(timer); timer = setTimeout(() => fn(...a), t); };
   }
 
   const CODE_MAP = {
@@ -90,16 +85,35 @@ const App = (() => {
       const r = await fetch(url);
       if (!r.ok) return null;
       return r.json();
-    } catch (e) {
-      return null;
+    } catch (e) { return null; }
+  }
+
+  class RequestPool {
+    constructor(max = OPTS.MAX_CONCURRENT) { this.max = max; this.running = 0; this.queue = []; }
+    push(task) { return new Promise((res, rej) => { this.queue.push({task, res, rej}); this._next(); }); }
+    _next() {
+      if (this.running >= this.max || this.queue.length === 0) return;
+      const item = this.queue.shift(); this.running++;
+      Promise.resolve().then(() => item.task()).then(v => { item.res(v); }).catch(e => { item.rej(e); }).finally(() => { this.running--; this._next(); });
     }
   }
 
-  async function getForecast(lat, lon, days = 3) {
-    const url = `${ENDPOINTS.FORECAST}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&daily=temperature_2m_max,temperature_2m_min,weathercode&timezone=auto&forecast_days=${days}`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error('forecast error');
-    return r.json();
+  const pool = new RequestPool(OPTS.MAX_CONCURRENT);
+  const forecastCache = new Map();
+
+  function coordsKey(lat, lon) { return `${(Math.round(lat * 1e6) / 1e6).toFixed(6)},${(Math.round(lon * 1e6) / 1e6).toFixed(6)}`; }
+
+  async function fetchForecast(lat, lon, days = OPTS.FORECAST_DAYS, force = false) {
+    const key = coordsKey(lat, lon);
+    const now = Date.now();
+    if (!force && forecastCache.has(key)) {
+      const item = forecastCache.get(key);
+      if (now - item.ts < OPTS.CACHE_TTL_MS) return item.data;
+    }
+    const task = () => fetch(`${ENDPOINTS.FORECAST}?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&daily=temperature_2m_max,temperature_2m_min,weathercode&timezone=auto&forecast_days=${days}`).then(r => { if (!r.ok) throw new Error('forecast error'); return r.json(); });
+    const res = await pool.push(task);
+    forecastCache.set(key, { ts: now, data: res });
+    return res;
   }
 
   class WeatherController {
@@ -140,11 +154,11 @@ const App = (() => {
         });
       }
       document.addEventListener('click', (e) => {
-        if (!this.view.input.contains(e.target) && this.view.suggestions && !this.view.suggestions.contains(e.target)) {
+        if (this.view.input && !this.view.input.contains(e.target) && this.view.suggestions && !this.view.suggestions.contains(e.target)) {
           this.view.suggestions.style.display = 'none'; this.view.suggestions.innerHTML = '';
         }
       });
-      if (this.view.refreshBtn) this.view.refreshBtn.addEventListener('click', () => this.refreshAll());
+      if (this.view.refreshBtn) this.view.refreshBtn.addEventListener('click', () => this.refreshAll(true));
       if (this.view.addBtn) this.view.addBtn.addEventListener('click', () => this.addFromInput());
       if (this.view.geoBtn) this.view.geoBtn.addEventListener('click', () => this.applyGeo(true));
     }
@@ -207,7 +221,8 @@ const App = (() => {
     }
 
     _dupCoords(lat, lon) {
-      return Array.isArray(this.savedCities) && this.savedCities.some(c => Math.abs((c.lat || 0) - (lat || 0)) < 1e-6 && Math.abs((c.lon || 0) - (lon || 0)) < 1e-6);
+      const key = coordsKey(lat, lon);
+      return Array.isArray(this.savedCities) && this.savedCities.some(c => coordsKey(c.lat || 0, c.lon || 0) === key);
     }
 
     renderAll() {
@@ -218,12 +233,14 @@ const App = (() => {
         this._updateHeader();
         return;
       }
+      const nodes = [];
       for (const c of this.savedCities) {
         const card = this._buildCard(c);
-        this.view.container.appendChild(card);
-        this._populateCard(c, card);
+        nodes.push(card);
       }
-      this._updateHeader();
+      nodes.forEach(n => this.view.container.appendChild(n));
+      const fills = this.savedCities.map((c, i) => this._populateCard(c, nodes[i]));
+      return Promise.all(fills).then(() => this._updateHeader()).catch(() => this._updateHeader());
     }
 
     _buildCard(city) {
@@ -250,7 +267,7 @@ const App = (() => {
       return wrap;
     }
 
-    async _populateCard(city, elCard) {
+    async _populateCard(city, elCard, force = false) {
       const body = elCard.querySelector('.card-body'); if (!body) return;
       body.innerHTML = `<p class="loading">Загрузка...</p>`;
       try {
@@ -261,7 +278,7 @@ const App = (() => {
           const best = g.results[0];
           lat = best.latitude; lon = best.longitude; city.lat = lat; city.lon = lon; storage.save('cities', this.savedCities);
         }
-        const fx = await getForecast(lat, lon, 3);
+        const fx = await fetchForecast(lat, lon, OPTS.FORECAST_DAYS, force);
         const times = (fx.daily && fx.daily.time) ? fx.daily.time : [];
         const tmin = (fx.daily && fx.daily.temperature_2m_min) ? fx.daily.temperature_2m_min : [];
         const tmax = (fx.daily && fx.daily.temperature_2m_max) ? fx.daily.temperature_2m_max : [];
@@ -281,12 +298,14 @@ const App = (() => {
       }
     }
 
-    async refreshAll() {
-      const cards = document.querySelectorAll('.weather-card');
-      for (const c of cards) {
+    async refreshAll(force = false) {
+      forecastCache.clear();
+      const cards = Array.from(document.querySelectorAll('.weather-card'));
+      const promises = cards.map(c => {
         const id = c.dataset.id; const city = this.savedCities.find(x => x.id === id);
-        if (city) await this._populateCard(city, c);
-      }
+        if (city) return this._populateCard(city, c, force); return Promise.resolve();
+      });
+      return Promise.all(promises);
     }
 
     _getPos(opts = {}) {
@@ -300,7 +319,6 @@ const App = (() => {
       try {
         const pos = await this._getPos({ timeout: OPTS.GEO_WAIT_MS });
         const lat = pos.coords.latitude; const lon = pos.coords.longitude;
-
         let disp = null;
         const rev = await geoReverse(lat, lon, 1);
         if (rev && rev.results && rev.results[0]) {
@@ -308,7 +326,6 @@ const App = (() => {
           disp = `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ', ' + r.country : ''}`;
         }
         if (!disp) disp = 'Текущее местоположение';
-
         const existing = Array.isArray(this.savedCities) ? this.savedCities.find(x => x.isGeo) : undefined;
         if (existing) {
           existing.lat = lat; existing.lon = lon; existing.displayName = disp;
